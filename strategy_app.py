@@ -2,11 +2,26 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.express as px
+import os
+import re
+import logging
+from typing import Dict, List, Optional
 
-# --- CONFIGURATION: YOUR REAL HOLDINGS (From Image) ---
-MY_PORTFOLIO = ["MU", "WDC", "MRVL", "NVT", "STX", "VRT", "ASML", "ANET", "GEV"]
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION: SCOUT LIST (Excluding what you already own to find NEW ideas) ---
+# --- SECURITY: ENVIRONMENT-BASED CONFIGURATION ---
+def load_portfolio_from_env() -> List[str]:
+    # We pre-set your Revolut stocks as the default if the environment variable isn't found
+    default_portfolio = "MU,WDC,MRVL,NVT,STX,VRT,ASML,ANET,GEV"
+    portfolio_str = os.getenv("PORTFOLIO_TICKERS", default_portfolio)
+    return [t.strip().upper() for t in portfolio_str.split(",")]
+
+MY_PORTFOLIO = load_portfolio_from_env()
+CAPITAL_DEFAULT = float(os.getenv("CAPITAL_DEFAULT", "2500"))
+
+# --- CONFIGURATION: SCOUT LIST ---
 AI_THEME_WATCHLIST = {
     "Compute (Chips)": ["NVDA", "AMD", "AVGO", "ARM"],
     "Equipment/Foundry": ["AMAT", "LRCX", "TSM"],
@@ -16,129 +31,115 @@ AI_THEME_WATCHLIST = {
 
 st.set_page_config(page_title="AI Strategy & Deployment", layout="wide")
 
+# --- SECURITY: INPUT VALIDATION ---
+def validate_ticker(ticker: str) -> bool:
+    return bool(re.match(r'^[A-Z]{1,5}$', ticker.strip().upper()))
+
+def validate_tickers_list(tickers: List[str]) -> List[str]:
+    return [t.strip().upper() for t in tickers if validate_ticker(t)]
+
 # --- OPTIMIZED DATA FETCHING ---
 @st.cache_data(ttl=3600)
-def get_bulk_market_data(portfolio_tickers, watchlist_dict):
-    all_watchlist_tickers = [item for sublist in watchlist_dict.values() for item in sublist]
-    unique_tickers = list(set(portfolio_tickers + all_watchlist_tickers))
-    # Batch download to prevent rate limits
-    data = yf.download(unique_tickers, period="1mo", interval="1d", group_by='ticker')
-    return data
+def get_bulk_market_data(portfolio_tickers: List[str], watchlist_dict: Dict) -> Optional[pd.DataFrame]:
+    try:
+        all_watchlist_tickers = [item for sublist in watchlist_dict.values() for item in sublist]
+        unique_tickers = list(set(validate_tickers_list(portfolio_tickers + all_watchlist_tickers)))
+        
+        if not unique_tickers:
+            return None
+        
+        data = yf.download(unique_tickers, period="1mo", interval="1d", group_by='ticker', progress=False)
+        return data
+    except Exception as e:
+        st.error(f"Market Data Error: {str(e)}")
+        return None
 
-def calculate_rsi(series, periods=14):
-    if len(series) < periods: return 50
+def calculate_rsi(series: pd.Series, periods: int = 14) -> pd.Series:
+    if len(series) < periods:
+        return pd.Series([50] * len(series), index=series.index)
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
-    rs = gain / loss
+    rs = gain / loss.replace(0, float('inf'))
     return 100 - (100 / (1 + rs))
 
-# --- MOCK AUDIT SCORE (This pulls from your Audit App Logic) ---
-def load_audit_results():
-    return {
-        "portfolio_risk_score": 42, # Logic from your Audit App
-        "top_flagged_risk": "Concentration in Memory & Storage",
-        "holdings": MY_PORTFOLIO
-    }
+def load_audit_results(portfolio: List[str]) -> Dict:
+    # Pulling the Risk Score from the Audit App logic
+    risk_score = int(os.getenv("AUDIT_RISK_SCORE", "42"))
+    top_flag = os.getenv("AUDIT_TOP_FLAG", "Concentration in Memory & Storage")
+    return {"portfolio_risk_score": risk_score, "top_flagged_risk": top_flag, "holdings": portfolio}
 
-# --- APP LOGIC ---
+# --- APP UI ---
 st.title("🤖 AI Strategy & Capital Deployment")
 st.caption("Actioning the 'Investment & AI Risk Audit' Outcomes")
 
-audit = load_audit_results()
+audit = load_audit_results(MY_PORTFOLIO)
 all_data = get_bulk_market_data(audit['holdings'], AI_THEME_WATCHLIST)
+
+if all_data is None:
+    st.error("Connection Error. Please refresh.")
+    st.stop()
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("Audit Pulse")
+    st.header("⚙️ Settings")
     score = audit['portfolio_risk_score']
-    st.metric("Portfolio Risk Score", f"{score}/100")
-    st.info(f"Primary Flag: {audit['top_flagged_risk']}")
+    risk_color = "🔴" if score > 70 else "🟡" if score > 40 else "🟢"
+    st.metric("Portfolio Risk Score", f"{risk_color} {score}/100")
+    st.info(f"Flag: {audit['top_flagged_risk']}")
     st.divider()
-    st.subheader("Deployment Settings")
-    capital_to_deploy = st.number_input("New Capital Available ($)", value=5000)
+    capital_to_deploy = st.number_input("Capital Available ($)", value=CAPITAL_DEFAULT)
 
-# --- SECTION 1: PORTFOLIO COURSE CORRECTION ---
+# --- SECTION 1: PORTFOLIO ---
 st.header("1. Existing Portfolio Strategy")
-st.markdown("Evaluating current holdings based on Audit Risk and Market Overextension.")
-
 action_data = []
 for ticker in audit['holdings']:
     try:
-        ticker_close = all_data[ticker]['Close']
-        current_price = ticker_close.iloc[-1]
-        rsi = calculate_rsi(ticker_close).iloc[-1]
-        
-        # Decision Logic
-        if rsi > 75 and score > 60:
-            rec, color = "🔴 Trim / Hedge", "Red"
-            logic = "Overbought + High Audit Risk"
-        elif rsi < 40:
-            rec, color = "🟢 Add / Accumulate", "Green"
-            logic = "Oversold - Strategic Entry"
-        else:
-            rec, color = "🟡 Hold", "Orange"
-            logic = "Maintain Exposure"
+        if ticker in all_data.columns:
+            ticker_close = all_data[ticker]['Close']
+            rsi = calculate_rsi(ticker_close).iloc[-1]
+            price = ticker_close.iloc[-1]
             
-        action_data.append({
-            "Ticker": ticker, 
-            "Current Price": f"${current_price:.2f}",
-            "RSI (14d)": round(rsi, 2),
-            "Action Move": rec, 
-            "Strategic Logic": logic
-        })
-    except:
-        continue
+            if rsi > 75 and score > 60:
+                rec, logic = "🔴 Trim", "Overbought + High Risk"
+            elif rsi < 40:
+                rec, logic = "🟢 Add", "Oversold Opportunity"
+            else:
+                rec, logic = "🟡 Hold", "Neutral"
+            
+            action_data.append({"Ticker": ticker, "Price": f"${price:.2f}", "RSI": round(rsi, 1), "Action": rec, "Logic": logic})
+    except: continue
 
 st.table(pd.DataFrame(action_data))
 
-# --- SECTION 2: CAPITAL SCOUTING (NEW DEPLOYMENT) ---
+# --- SECTION 2: SCOUT ---
 st.header("2. New Capital Deployment Scout")
-st.markdown("Searching for the best place to deploy capital in the AI/Semiconductor thematic.")
-
 scout_results = []
-for category, tickers in AI_THEME_WATCHLIST.items():
+for cat, tickers in AI_THEME_WATCHLIST.items():
     for t in tickers:
         try:
-            ticker_close = all_data[t]['Close']
-            rsi = calculate_rsi(ticker_close).iloc[-1]
-            price_start = ticker_close.iloc[0]
-            price_end = ticker_close.iloc[-1]
-            mom = ((price_end / price_start) - 1) * 100
-            
-            if rsi < 45:
-                status = "🔥 Value Zone"
-            elif rsi > 70:
-                status = "❄️ Overheated"
-            else:
-                status = "✅ Balanced"
-                
-            scout_results.append({
-                "Sector": category, "Ticker": t, "RSI": round(rsi, 2), 
-                "MoM %": round(mom, 2), "Signal": status
-            })
-        except:
-            continue
+            if t in all_data.columns:
+                px_close = all_data[t]['Close']
+                rsi = calculate_rsi(px_close).iloc[-1]
+                mom = ((px_close.iloc[-1] / px_close.iloc[0]) - 1) * 100
+                scout_results.append({"Sector": cat, "Ticker": t, "RSI": round(rsi, 1), "MoM %": round(mom, 1)})
+        except: continue
 
 scout_df = pd.DataFrame(scout_results)
-
-# Best Suggestion Logic
 best_entry = scout_df.sort_values(by="RSI").iloc[0]
 
 c1, c2 = st.columns([1, 2])
 with c1:
-    st.metric("Top Deployment Target", best_entry['Ticker'], help="Lowest RSI in Watchlist")
+    st.metric("Top Deployment Target", best_entry['Ticker'])
     st.write(f"**Sector:** {best_entry['Sector']}")
-    st.write(f"**Reason:** RSI is at {best_entry['RSI']}, indicating it is the least 'overbought' in the AI thematic right now.")
-
+    st.write(f"**Reason:** RSI {best_entry['RSI']} (Most Oversold)")
 with c2:
-    st.dataframe(scout_df.sort_values(by="RSI"), use_container_width=True)
+    st.dataframe(scout_df.sort_values(by="RSI"), use_container_width=True, hide_index=True)
 
-# --- SECTION 3: VISUAL MATRIX ---
+# --- SECTION 3: HEATMAP ---
 st.header("3. Market Heatmap")
 fig = px.scatter(scout_df, x="RSI", y="MoM %", text="Ticker", color="Sector",
-                 title="AI Value Chain: Entry Points",
-                 labels={"RSI": "RSI (Strength Index)", "MoM %": "Monthly Momentum"})
-fig.add_vline(x=30, line_dash="dash", line_color="green", annotation_text="Oversold")
-fig.add_vline(x=70, line_dash="dash", line_color="red", annotation_text="Overbought")
+                 title="AI Value Chain: Entry Points")
+fig.add_vline(x=30, line_dash="dash", line_color="green")
+fig.add_vline(x=70, line_dash="dash", line_color="red")
 st.plotly_chart(fig, use_container_width=True)
